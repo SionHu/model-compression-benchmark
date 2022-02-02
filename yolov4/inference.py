@@ -11,6 +11,7 @@ import colorsys
 import random
 import time
 import glob
+import argparse
 
 # ======= Preprocessing =======
 def image_preprocess(image, target_size, gt_boxes=None):
@@ -203,6 +204,16 @@ def draw_bbox(image, bboxes, classes=read_class_names("coco.names"), show_label=
     return image, statistics.mean(probability)
 
 def main():
+    # ======= Command-line Arguments =======
+    parser = argparse.ArgumentParser(description='Run the model on given imgae dataset for object detection. acc and FPS are reported.')
+    parser.add_argument('-m', '--model', metavar='MODEL', required=True,
+                        help='path of the model')
+    parser.add_argument('-i', '--input', metavar='INPUT', required=True,
+                        help='path to the input image folder')
+    parser.add_argument('-s', '--stop', metavar='STOPPERz', type=int, default=np.inf,
+                        help='set a breaking point to stop early for testing')
+    args = parser.parse_args()
+
     # ======= Inference =======
     # Start from ORT 1.10, ORT requires explicitly setting the providers parameter if you want to use execution providers
     # other than the default CPU provider (as opposed to the previous behavior of providers getting set/registered by default
@@ -217,9 +228,12 @@ def main():
     ANCHORS = get_anchors(ANCHORS)
     STRIDES = np.array(STRIDES)
 
+    sess = rt.InferenceSession(args.model)
+
     input_size = 416
-    folder_path = "/home/lpmot/Dataset/COCO2017/test2017/*"
+    # folder_path = "/home/lpmot/Dataset/COCO2017/test2017/*"\
     # folder_path = "/home/lpmot/Dataset/COCO2017/test2017/000000378084.jpg"
+    folder_path = args.input + '*'
     acc_list, FPS = [], []
 
     for i, im_path in enumerate(glob.glob(folder_path)):
@@ -234,7 +248,6 @@ def main():
         # print(" - Preprocessed image shape:",image_data.shape) # shape of the preprocessed input
         # imsave("sample.jpg", np.asarray(original_image))
 
-        sess = rt.InferenceSession("model/yolov4.onnx")
         outputs = sess.get_outputs()
         output_names = list(map(lambda output: output.name, outputs))
         input_name = sess.get_inputs()[0].name
@@ -258,7 +271,8 @@ def main():
         FPS.append(fps)
         print(f' - acc: {acc}; FPS: {fps}')
 
-        if i == 10: break
+        # loop stop early for testing
+        if i == args.stop: break
 
     print(f'Done. mAP: {statistics.mean(acc_list)}, mean FPS: {statistics.mean(FPS)}')
 
