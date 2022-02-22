@@ -1,0 +1,40 @@
+loading annotations into memory...
+Done (t=2.40s)
+creating index...
+index created!
+Number of Images to be processed: 100
+
+ - model: yolov4.onnx, mConfidence: 0.72762807, mFPS: 1.55940589, mAcc: 0.6342467
+
+loading annotations into memory...
+Done (t=2.19s)
+creating index...
+index created!
+Number of Images to be processed: 100
+
+ - model: yolov4-416.onnx, mConfidence: 0.71740961, mFPS: 1.56023507, mAcc: 0.47455133
+
+loading annotations into memory...
+Done (t=2.24s)
+creating index...
+index created!
+Number of Images to be processed: 100
+
+ - model: yolov4-416-fp16.onnx, mConfidence: 0.71747496, mFPS: 1.5549176, mAcc: 0.47455133
+
+loading annotations into memory...
+Done (t=2.23s)
+creating index...
+index created!
+Number of Images to be processed: 100
+
+ - model: yolov4-416-int8.onnx, mConfidence: 0.71654306, mFPS: 1.4964507, mAcc: 0.47000894
+
+loading annotations into memory...
+Done (t=2.29s)
+creating index...
+index created!
+Number of Images to be processed: 100
+
+ - model: yolov4-416-int16.onnx, mConfidence: 0.71654306, mFPS: 1.50202034, mAcc: 0.47000894
+
