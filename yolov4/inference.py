@@ -2,11 +2,12 @@ import cv2
 import numpy as np
 from onnx import numpy_helper
 import onnx
+import onnx_tensorrt.backend as backend
 import os, statistics
 from PIL import Image
 from matplotlib.pyplot import imshow, imsave
 import matplotlib.pyplot as plt
-import onnxruntime as rt
+# import onnxruntime as rt
 from scipy import special
 import colorsys
 import random
@@ -20,7 +21,6 @@ from pycocotools.coco import COCO
 from pathlib import Path
 from tqdm import tqdm
 
-# ======= Preprocessing =======
 def image_preprocess(image, target_size, gt_boxes=None):
 
     ih, iw = target_size
@@ -43,7 +43,6 @@ def image_preprocess(image, target_size, gt_boxes=None):
         gt_boxes[:, [1, 3]] = gt_boxes[:, [1, 3]] * scale + dh
         return image_padded, gt_boxes
 
-# ======= Post-procesing Output =======
 def get_anchors(anchors_path, tiny=False):
     '''loads the anchors from a file'''
     with open(anchors_path) as f:
@@ -222,52 +221,13 @@ def draw_bbox(quantized, image, bboxes, classes=read_class_names("coco.names"), 
     mean_prob = statistics.mean(probability) if len(probability) != 0 else 0
     return image, mean_prob, names
 
-def convert_coco_json_to_csv(filename):
-    """
-    path/to/image.jpg,x1,y1,x2,y2,class_name
-    """
-    # COCO2017/annotations/instances_val2017.json
-    s = json.load(open(filename, 'r'))
-    out_file = filename[:-5] + '.csv'
-    out = open(out_file, 'w')
-    out.write('id,x1,y1,x2,y2,label\n')
-
-    all_ids = []
-    for im in s['images']:
-        all_ids.append(im['id'])
-
-    all_ids_ann = []
-    for ann in s['annotations']:
-        image_id = ann['image_id']
-        all_ids_ann.append(image_id)
-        x1 = ann['bbox'][0]
-        x2 = ann['bbox'][0] + ann['bbox'][2]
-        y1 = ann['bbox'][1]
-        y2 = ann['bbox'][1] + ann['bbox'][3]
-        label = ann['category_id']
-        out.write('{},{},{},{},{},{}\n'.format(image_id, x1, y1, x2, y2, label))
-
-    all_ids = set(all_ids)
-    all_ids_ann = set(all_ids_ann)
-    no_annotations = list(all_ids - all_ids_ann)
-    # Output images without any annotations
-    for image_id in no_annotations:
-        out.write('{},{},{},{},{},{}\n'.format(image_id, -1, -1, -1, -1, -1))
-    out.close()
-
-    # Sort file by image id
-    s1 = pd.read_csv(out_file)
-    s1.sort_values('id', inplace=True)
-    s1.to_csv(out_file, index=False)
 
 def categoryID2name(coco_annotation, query_id):
     query_annotation = coco_annotation.loadCats([query_id])[0]
     query_name = query_annotation["name"]
     query_supercategory = query_annotation["supercategory"]
     # print(" - Category ID -> Category Name:")
-    # print(
-    #     f" - Category ID: {query_id}, Category Name: {query_name}, Supercategory: {query_supercategory}"
-    # )
+    # print(f" - Category ID: {query_id}, Category Name: {query_name}, Supercategory: {query_supercategory}")
     return query_name
 
 def main():
@@ -334,7 +294,9 @@ def main():
     STRIDES = np.array(STRIDES)
 
     # rt.get_device()
-    sess = rt.InferenceSession(args.model, providers=['CUDAExecutionProvider'])
+    # sess = rt.InferenceSession(args.model, providers=['CUDAExecutionProvider'])
+    model = onnx.load(args.model)
+    sess = backend.prepare(model, device='CUDA:0')
     input_size = 416
 
     acc_list, conf_list, FPS = [], [], []
