@@ -2,7 +2,7 @@ import cv2, os, sys
 import numpy as np
 from onnx import numpy_helper
 import onnx
-import os, statistics
+from statistics import mean
 from PIL import Image, ImageDraw, ImageColor
 from matplotlib.pyplot import imshow, imsave
 import matplotlib.pyplot as plt
@@ -15,7 +15,6 @@ import glob
 import argparse
 import json
 import pprint
-import pandas as pd
 from pycocotools.coco import COCO
 from pathlib import Path
 from tqdm import tqdm
@@ -129,7 +128,8 @@ def main():
         img = Image.open(img_path)
         img_data = np.array(img.getdata()).reshape(img.size[1], img.size[0], 3)
         img_data = np.expand_dims(img_data.astype(np.uint8), axis=0)
-        print(img_data.shape)
+        height, width = img_data.shape[1],img_data.shape[2]
+        # print(img_data.shape)
 
         # ======= Processing =======
         annIds = coco_annotation.getAnnIds(imgIds=[img_id],  iscrowd=None)
@@ -137,38 +137,55 @@ def main():
         start = time.time()
         result = sess.run(outputs, {"image_tensor:0": img_data})
         num_detections, detection_boxes, detection_scores, detection_classes = result
+        names = [categoryID2name(coco_annotation, id) for id in detection_classes[0]]
         end = time.time()
 
-        print(detection_boxes)
-        # ======= Scores & Output =======
-        # output_im = Image.fromarray(image)
-        # gth_im = cv2.imread(img_path)
-        # detect_count = 0
-        # for ann in anns: # gth
-        #     query_id = ann['category_id']
-        #     query_name = categoryID2name(coco_annotation, query_id)
-        #     [x,y,w,h] = [int(i) for i in ann['bbox']]
-        #     boo = False
-        #     for i, bbox in enumerate(bboxes): # output
-        #         bbox_gth = np.array([x, y, x+w, y+h,])
-        #         if bboxes_iou(bbox_gth, bbox[:4]) > 0.5 and query_name == names[i]:
-        #             boo = True
-        #     detect_count += 1 if boo == True else 0
-        #
+        bboxes = []
+        for i, box in enumerate(detection_boxes[0]):
+            # [x_min, y_min, x_max, y_max]
+            bbox = [width*box[0], height*box[1], width*box[2], height*box[3]]
+            bboxes.append(bbox)
+            conf = mean(detection_scores[0])
+
+        # ======= Compare Output and Gth =======
+        gth_im = cv2.imread(img_path)
+        detect_count = 0
+        for ann in anns: # gth
+            query_id = ann['category_id']
+            query_name = categoryID2name(coco_annotation, query_id)
+            [x,y,w,h] = [int(i) for i in ann['bbox']]
+            boo = False
+            for i, bbox in enumerate(bboxes): # output
+                bbox_gth = np.array([x, y, x+w, y+h,])
+                if bboxes_iou(bbox_gth, bbox) >= 0.5  and query_name == names[i]:
+                    boo = True
+            detect_count += 1 if boo == True else 0
         # print(f' - detected: {detect_count}')
 
-        # draw bbox on the image
-        batch_size = num_detections.shape[0]
-        draw = ImageDraw.Draw(img)
-        for batch in range(0, batch_size):
-            for detection in range(0, int(num_detections[batch])):
-                c = detection_classes[batch][detection]
-                d = detection_boxes[batch][detection]
-                draw_detection(draw, d, c)
+        if args.save:
+            # draw bbox on the image
+            batch_size = num_detections.shape[0]
+            draw = ImageDraw.Draw(img)
+            for batch in range(0, batch_size):
+                for detection in range(0, int(num_detections[batch])):
+                    c = detection_classes[batch][detection]
+                    d = detection_boxes[batch][detection]
+                    draw_detection(draw, d, c)
 
-        plt.figure(figsize=(80, 40))
-        plt.axis('off')
-        plt.imsave('output.jpg', img)
+            plt.figure(figsize=(80, 40))
+            plt.axis('off')
+            plt.imsave('output.jpg', img)
+
+        # ======= Generate Scores =======
+        conf = round(conf, 6)
+        fps = round(1/(end-start), 6)
+        acc = round(detect_count / len(anns) if len(anns) != 0 else 0, 6)
+        conf_list.append(conf)
+        FPS.append(fps)
+        acc_list.append(acc)
+
+    print(f' - model: {args.model.split("/")[-1]}, mConfidence: {mean(conf_list)}, mFPS: {mean(FPS)}, mAcc: {mean(acc_list)}\n')
+
 
 if __name__ == '__main__':
     main()
