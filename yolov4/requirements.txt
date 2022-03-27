@@ -1,7 +1,7 @@
 matplotlib==3.3.4
 numpy==1.17.4
 onnx==1.11.0
-onnxruntime==1.11.0
+onnxruntime==1.10.0
 opencv_python==4.5.5.64
 Pillow==9.0.1
 pycocotools==2.0.4
