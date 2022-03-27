@@ -1,10 +1,13 @@
+
 import cv2
 import numpy as np
 from onnx import numpy_helper
 import onnx
+# import onnx_tensorrt.backend as backend
 import os, statistics
 from PIL import Image
 from matplotlib.pyplot import imshow, imsave
+import matplotlib.pyplot as plt
 import onnxruntime as rt
 from scipy import special
 import colorsys
@@ -12,8 +15,11 @@ import random
 import time
 import glob
 import argparse
+import json
+from pycocotools.coco import COCO
+from pathlib import Path
+from tqdm import tqdm
 
-# ======= Preprocessing =======
 def image_preprocess(image, target_size, gt_boxes=None):
 
     ih, iw = target_size
@@ -36,7 +42,6 @@ def image_preprocess(image, target_size, gt_boxes=None):
         gt_boxes[:, [1, 3]] = gt_boxes[:, [1, 3]] * scale + dh
         return image_padded, gt_boxes
 
-# ======= Post-procesing Output =======
 def get_anchors(anchors_path, tiny=False):
     '''loads the anchors from a file'''
     with open(anchors_path) as f:
@@ -44,42 +49,43 @@ def get_anchors(anchors_path, tiny=False):
     anchors = np.array(anchors.split(','), dtype=np.float32)
     return anchors.reshape(3, 3, 2)
 
-def postprocess_bbbox(pred_bbox, ANCHORS, STRIDES, XYSCALE=[1,1,1]):
+def postprocess_bbbox(quantized, pred_bbox, ANCHORS, STRIDES, XYSCALE=[1,1,1]):
     '''define anchor boxes'''
-    # for i, pred in enumerate(pred_bbox):
-    #     conv_shape = pred.shape
-    #     output_size = conv_shape[1]
-    #     conv_raw_dxdy = pred[:, :, :, :, 0:2]
-    #     conv_raw_dwdh = pred[:, :, :, :, 2:4]
-    #     xy_grid = np.meshgrid(np.arange(output_size), np.arange(output_size))
-    #     xy_grid = np.expand_dims(np.stack(xy_grid, axis=-1), axis=2)
-    #
-    #     xy_grid = np.tile(np.expand_dims(xy_grid, axis=0), [1, 1, 1, 3, 1])
-    #     xy_grid = xy_grid.astype(float)
-    #
-    #     pred_xy = ((special.expit(conv_raw_dxdy) * XYSCALE[i]) - 0.5 * (XYSCALE[i] - 1) + xy_grid) * STRIDES[i]
-    #     pred_wh = (np.exp(conv_raw_dwdh) * ANCHORS[i])
-    #     pred[:, :, :, :, 0:4] = np.concatenate([pred_xy, pred_wh], axis=-1)
-    #
-    # pred_bbox = [np.reshape(x, (-1, np.shape(x)[-1])) for x in pred_bbox]
-    pred_bbox = np.concatenate((pred_bbox[0], pred_bbox[1]), axis=2)
-    x, y, z = pred_bbox.shape
-    pred_bbox = np.reshape(pred_bbox, (y, z))
-    print(pred_bbox.shape)
-    # pred_bbox = np.concatenate(pred_bbox, axis=0)
-    # print(pred_bbox.shape)
+
+    # if used quantized model, we actually dont need to do anything
+    if quantized:
+        pred_bbox = np.concatenate((pred_bbox[0], pred_bbox[1]), axis=2)
+        x, y, z = pred_bbox.shape
+        pred_bbox = np.reshape(pred_bbox, (y, z))
+        return pred_bbox
+
+    for i, pred in enumerate(pred_bbox):
+        conv_shape = pred.shape
+        output_size = conv_shape[1]
+        conv_raw_dxdy = pred[:, :, :, :, 0:2]
+        conv_raw_dwdh = pred[:, :, :, :, 2:4]
+        xy_grid = np.meshgrid(np.arange(output_size), np.arange(output_size))
+        xy_grid = np.expand_dims(np.stack(xy_grid, axis=-1), axis=2)
+
+        xy_grid = np.tile(np.expand_dims(xy_grid, axis=0), [1, 1, 1, 3, 1])
+        xy_grid = xy_grid.astype(float)
+
+        pred_xy = ((special.expit(conv_raw_dxdy) * XYSCALE[i]) - 0.5 * (XYSCALE[i] - 1) + xy_grid) * STRIDES[i]
+        pred_wh = (np.exp(conv_raw_dwdh) * ANCHORS[i])
+        pred[:, :, :, :, 0:4] = np.concatenate([pred_xy, pred_wh], axis=-1)
+
+    pred_bbox = [np.reshape(x, (-1, np.shape(x)[-1])) for x in pred_bbox]
+    pred_bbox = np.concatenate(pred_bbox, axis=0)
     return pred_bbox
 
-def postprocess_boxes(pred_bbox, org_img_shape, input_size, score_threshold):
+def postprocess_boxes(quantized, pred_bbox, org_img_shape, input_size, score_threshold):
     '''remove boundary boxs with a low detection probability'''
     valid_scale=[0, np.inf]
     pred_bbox = np.array(pred_bbox)
 
     pred_xywh = pred_bbox[:, 0:4]
-    print(pred_xywh.shape)
-    # pred_conf = pred_bbox[:, 4]
-    pred_conf = 1
-    pred_prob = pred_bbox[:, 4:]
+    pred_conf = pred_bbox[:, 4] if not quantized else 1
+    pred_prob = pred_bbox[:, 5:]
 
     # # (1) (x, y, w, h) --> (xmin, ymin, xmax, ymax)
     pred_coor = np.concatenate([pred_xywh[:, :2] - pred_xywh[:, 2:] * 0.5,
@@ -134,7 +140,6 @@ def bboxes_iou(boxes1, boxes2):
 def nms(bboxes, iou_threshold, sigma=0.3, method='nms'):
     """
     :param bboxes: (xmin, ymin, xmax, ymax, score, class)
-
     Note: soft-nms, https://arxiv.org/pdf/1704.04503.pdf
           https://github.com/bharatsingh430/soft-nms
     """
@@ -176,16 +181,17 @@ def read_class_names(class_file_name):
             names[ID] = name.strip('\n')
     return names
 
-def draw_bbox(image, bboxes, classes=read_class_names("coco.names"), show_label=True):
+def draw_bbox(quantized, image, bboxes, classes=read_class_names("coco.names"), show_label=True):
     """
     bboxes: [x_min, y_min, x_max, y_max, probability, cls_id] format coordinates.
+    returrn image, mean_prob, names
     """
     num_classes = len(classes)
     image_h, image_w, _ = image.shape
     hsv_tuples = [(1.0 * x / num_classes, 1., 1.) for x in range(num_classes)]
     colors = list(map(lambda x: colorsys.hsv_to_rgb(*x), hsv_tuples))
     colors = list(map(lambda x: (int(x[0] * 255), int(x[1] * 255), int(x[2] * 255)), colors))
-    probability = []
+    probability, names = [], []
 
     random.seed(0)
     random.shuffle(colors)
@@ -201,14 +207,25 @@ def draw_bbox(image, bboxes, classes=read_class_names("coco.names"), show_label=
         c1, c2 = (coor[0], coor[1]), (coor[2], coor[3])
         cv2.rectangle(image, c1, c2, bbox_color, bbox_thick)
         probability.append(score)
+        cls_name = classes[class_ind] if not quantized else classes[class_ind+1]
+        names.append(cls_name)
 
         if show_label:
-            bbox_mess = '%s: %.2f' % (classes[class_ind], score)
+            bbox_mess = '%s: %.2f' % (cls_name, score)
             t_size = cv2.getTextSize(bbox_mess, 0, fontScale, thickness=bbox_thick//2)[0]
             cv2.rectangle(image, c1, (c1[0] + t_size[0], c1[1] - t_size[1] - 3), bbox_color, -1)
             cv2.putText(image, bbox_mess, (c1[0], c1[1]-2), cv2.FONT_HERSHEY_SIMPLEX,
                         fontScale, (0, 0, 0), bbox_thick//2, lineType=cv2.LINE_AA)
-    return image, statistics.mean(probability)
+    mean_prob = statistics.mean(probability) if len(probability) != 0 else 0
+    return image, mean_prob, names
+
+def categoryID2name(coco_annotation, query_id):
+    query_annotation = coco_annotation.loadCats([query_id])[0]
+    query_name = query_annotation["name"]
+    query_supercategory = query_annotation["supercategory"]
+    # print(" - Category ID -> Category Name:")
+    # print(f" - Category ID: {query_id}, Category Name: {query_name}, Supercategory: {query_supercategory}")
+    return query_name
 
 def main():
     # ======= Command-line Arguments =======
@@ -217,8 +234,14 @@ def main():
                         help='path of the model')
     parser.add_argument('-i', '--input', metavar='INPUT', required=True,
                         help='path to the input image folder')
-    parser.add_argument('-s', '--stop', metavar='STOPPERz', type=int, default=np.inf,
+    parser.add_argument('-a', '--annotation', metavar='ANNOTATION', required=True,
+                        help='path to the annotation json file')
+    parser.add_argument('-s', '--stop', metavar='STOP', type=int, default=np.inf,
                         help='set a breaking point to stop early for testing')
+    parser.add_argument('-q', '--quantized', dest='quantized', action='store_true',
+                        help='set to decide whether we used a quantized model or not')
+    parser.add_argument('--save', metavar='SAVE',
+                        help='path to save the visual output')
     args = parser.parse_args()
 
     # ======= Inference =======
@@ -228,6 +251,38 @@ def main():
     # For example, if NVIDIA GPU is available and ORT Python package is built with CUDA, then call API as following:
     # rt.InferenceSession(path/to/model, providers=['CUDAExecutionProvider'])
 
+    # Load gdourntruth annotations in to a dictionary
+    # https://leimao.github.io/blog/Inspecting-COCO-Dataset-Using-COCO-API/
+    coco_annotation_file_path = args.annotation
+    coco_annotation = COCO(annotation_file=coco_annotation_file_path)
+
+    # Category IDs and # All categories..
+    cat_ids = coco_annotation.getCatIds()
+    cats = coco_annotation.loadCats(cat_ids)
+    cat_names = [cat["name"] for cat in cats]
+    # print(f"Number of Unique Categories: {len(cat_ids)}")
+    # print(f"Category IDs: {cat_ids}") # The IDs are not necessarily consecutive.
+    # print(f"Categories Names: {cat_names}")
+
+    # # Category ID -> Category Name.
+    # query_id = cat_ids[0]
+    # query_annotation = coco_annotation.loadCats([query_id])[0]
+    # query_name = query_annotation["name"]
+    # query_supercategory = query_annotation["supercategory"]
+    # print("Category ID -> Category Name:")
+    # print(
+    #     f"Category ID: {query_id}, Category Name: {query_name}, Supercategory: {query_supercategory}"
+    # )
+    # # Category Name -> Category ID.
+    # query_name = cat_names[2]
+    # query_id = coco_annotation.getCatIds(catNms=[query_name])[0]
+    # print("Category Name -> ID:")
+    # print(f"Category Name: {query_name}, Category ID: {query_id}")
+
+    # Get the ID of all the images containing the object of the category.
+    img_ids = coco_annotation.getImgIds()[-args.stop:]
+    print(f"Number of Images to be processed: {len(img_ids)}\n")
+
     ANCHORS = "./yolov4_anchors.txt"
     STRIDES = [8, 16, 32]
     XYSCALE = [1.2, 1.1, 1.05]
@@ -235,57 +290,78 @@ def main():
     ANCHORS = get_anchors(ANCHORS)
     STRIDES = np.array(STRIDES)
 
-    sess = rt.InferenceSession(args.model)
-
+    rt.get_device()
+    sess = rt.InferenceSession(args.model, providers=['CUDAExecutionProvider'])
+    # model = onnx.load(args.model)
+    # sess = backend.prepare(model, device='CUDA:0')
     input_size = 416
-    # folder_path = "/home/lpmot/Dataset/COCO2017/test2017/*"\
-    # folder_path = "/home/lpmot/Dataset/COCO2017/test2017/000000378084.jpg"
-    folder_path = args.input + '*'
-    acc_list, FPS = [], []
 
-    for i, im_path in enumerate(glob.glob(folder_path)):
-        start = time.time()
+    acc_list, conf_list, FPS = [], [], []
+    for img_id in tqdm(img_ids):
 
-        original_image = cv2.imread(im_path)
+        # ======= Read the original image =======
+        img_info = coco_annotation.loadImgs([img_id])[0]
+        img_path = os.path.join(args.input, img_info['file_name'])
+        original_image = cv2.imread(img_path)
         original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
         original_image_size = original_image.shape[:2]
-
         image_data = image_preprocess(np.copy(original_image), [input_size, input_size])
         image_data = image_data[np.newaxis, ...].astype(np.float32)
         # print(" - Preprocessed image shape:",image_data.shape) # shape of the preprocessed input
         # imsave("sample.jpg", np.asarray(original_image))
 
+        # ======= Processing =======
+        annIds = coco_annotation.getAnnIds(imgIds=[img_id],  iscrowd=None)
+        anns = coco_annotation.loadAnns(annIds)
+        start = time.time()
         outputs = sess.get_outputs()
-        print(outputs)
         output_names = list(map(lambda output: output.name, outputs))
-        print(output_names)
         input_name = sess.get_inputs()[0].name
-        print(input_name)
         detections = sess.run(output_names, {input_name: image_data})
-        print(" - Output shape:", list(map(lambda detection: detection.shape, detections)))
-
-        # ======= Start Processing =======
-        pred_bbox = postprocess_bbbox(detections, ANCHORS, STRIDES, XYSCALE)
-        bboxes = postprocess_boxes(pred_bbox, original_image_size, input_size, 0.25)
-        print(bboxes.shape)
-        bboxes = nms(bboxes, 0.213, method='nms')
-        image, acc = draw_bbox(original_image, bboxes)
-        acc_list.append(acc)
         end = time.time()
+        # print(" - Output shape:", list(map(lambda detection: detection.shape, detections)))
 
-        # ======= Output =======
-        image = Image.fromarray(image)
-        # image.show()
-        # imsave("result.jpg", np.asarray(image))
+        # ======= Start Post-processing =======
+        pred_bbox = postprocess_bbbox(args.quantized, detections, ANCHORS, STRIDES, XYSCALE)
+        bboxes = postprocess_boxes(args.quantized, pred_bbox, original_image_size, input_size, 0.25)
+        bboxes = nms(bboxes, 0.213, method='nms')
+        image, conf, names = draw_bbox(args.quantized, original_image, bboxes)
 
-        fps = 1/(end-start)
+        # ======= Scores & Output =======
+        output_im = Image.fromarray(image)
+        gth_im = cv2.imread(img_path)
+        detect_count = 0
+        for ann in anns: # gth
+            query_id = ann['category_id']
+            query_name = categoryID2name(coco_annotation, query_id)
+            [x,y,w,h] = [int(i) for i in ann['bbox']]
+            boo = False
+            for i, bbox in enumerate(bboxes): # output
+                bbox_gth = np.array([x, y, x+w, y+h,])
+                if bboxes_iou(bbox_gth, bbox[:4]) > 0.5 and query_name == names[i]:
+                    boo = True
+            detect_count += 1 if boo == True else 0
+
+            # Draw the boxes
+            cv2.rectangle(gth_im, (x,y), (x+w, y+h), (0, 255, 0), 2)
+            gth_im = cv2.putText(gth_im, query_name, (x, y-20), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 1)
+
+
+        if args.save:
+            final = np.concatenate((np.asarray(output_im), np.asarray(gth_im)), axis = 0)
+            cv2.imwrite(f'{args.save}/{img_id}.jpg', final)
+
+        conf = round(conf, 6)
+        fps = round(1/(end-start), 6)
+        acc = round(detect_count / len(anns), 6)
+        conf_list.append(conf)
         FPS.append(fps)
-        print(f' - acc: {acc}; FPS: {fps}')
+        acc_list.append(acc)
 
-        # loop stop early for testing
-        if i == args.stop: break
+        # print(f' - Processing {img_path}')
+        # print(' - mConf: {:.4f}; FPS: {:.4f}; acc: {:.4f}'.format(conf, fps, acc))
 
-    print(f'Done. mAP: {statistics.mean(acc_list)}, mean FPS: {statistics.mean(FPS)}')
+    print(f' - model: {args.model.split("/")[-1]}, mConfidence: {statistics.mean(conf_list)}, mFPS: {statistics.mean(FPS)}, mAcc: {statistics.mean(acc_list)}\n')
 
 if __name__ == '__main__':
     main()

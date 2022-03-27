@@ -1,23 +1,43 @@
 import cv2
 import numpy as np
 from onnx import numpy_helper
-import onnx
-import onnx_tensorrt.backend as backend
 import os, statistics
+import onnx
+import onnxruntime as rt
 from PIL import Image
 from matplotlib.pyplot import imshow, imsave
 import matplotlib.pyplot as plt
-# import onnxruntime as rt
 from scipy import special
 import colorsys
 import random
 import time
-import glob
 import argparse
-import json
 from pycocotools.coco import COCO
-from pathlib import Path
 from tqdm import tqdm
+
+# ======= Command-line Arguments =======
+parser = argparse.ArgumentParser(description='Run the model on given imgae dataset for object detection. acc and FPS are reported.')
+parser.add_argument('-m', '--model', metavar='MODEL', required=True,
+                    help='path of the model')
+parser.add_argument('-i', '--input', metavar='INPUT', required=True,
+                    help='path to the input image folder')
+parser.add_argument('-a', '--annotation', metavar='ANNOTATION', required=True,
+                    help='path to the annotation json file')
+parser.add_argument('-s', '--stop', metavar='STOP', type=int, default=np.inf,
+                    help='set a breaking point to stop early for testing')
+parser.add_argument('-q', '--quantized', type=str,
+                    help='set to decide whether we used a quantized model or not')
+parser.add_argument('--save', metavar='SAVE',
+                    help='path to save the visual output')
+parser.add_argument('--gpu', action='store_true',
+                    help='Use GPU if available')
+args = parser.parse_args()
+
+DTYPE = None
+if args.quantized == 'fp32': DTYPE = np.float32
+elif args.quantized == 'fp16': DTYPE = np.float16
+else: print('dtype not available.')
+
 
 def image_preprocess(image, target_size, gt_boxes=None):
 
@@ -45,18 +65,18 @@ def get_anchors(anchors_path, tiny=False):
     '''loads the anchors from a file'''
     with open(anchors_path) as f:
         anchors = f.readline()
-    anchors = np.array(anchors.split(','), dtype=np.float32)
+    anchors = np.array(anchors.split(','), dtype=DTYPE)
     return anchors.reshape(3, 3, 2)
 
-def postprocess_bbbox(quantized, pred_bbox, ANCHORS, STRIDES, XYSCALE=[1,1,1]):
+def postprocess_bbbox(pred_bbox, ANCHORS, STRIDES, XYSCALE=[1,1,1]):
     '''define anchor boxes'''
 
     # if used quantized model, we actually dont need to do anything
-    if quantized:
-        pred_bbox = np.concatenate((pred_bbox[0], pred_bbox[1]), axis=2)
-        x, y, z = pred_bbox.shape
-        pred_bbox = np.reshape(pred_bbox, (y, z))
-        return pred_bbox
+    # if not args.quantized in [None]:
+    #     pred_bbox = np.concatenate((pred_bbox[0], pred_bbox[1]), axis=2)
+    #     x, y, z = pred_bbox.shape
+    #     pred_bbox = np.reshape(pred_bbox, (y, z))
+    #     return pred_bbox
 
     for i, pred in enumerate(pred_bbox):
         conv_shape = pred.shape
@@ -77,13 +97,14 @@ def postprocess_bbbox(quantized, pred_bbox, ANCHORS, STRIDES, XYSCALE=[1,1,1]):
     pred_bbox = np.concatenate(pred_bbox, axis=0)
     return pred_bbox
 
-def postprocess_boxes(quantized, pred_bbox, org_img_shape, input_size, score_threshold):
+def postprocess_boxes(pred_bbox, org_img_shape, input_size, score_threshold):
     '''remove boundary boxs with a low detection probability'''
     valid_scale=[0, np.inf]
     pred_bbox = np.array(pred_bbox)
 
     pred_xywh = pred_bbox[:, 0:4]
-    pred_conf = pred_bbox[:, 4] if not quantized else 1
+    # pred_conf = pred_bbox[:, 4] if args.quantized is not None else 1
+    pred_conf = pred_bbox[:, 4]
     pred_prob = pred_bbox[:, 5:]
 
     # # (1) (x, y, w, h) --> (xmin, ymin, xmax, ymax)
@@ -132,7 +153,7 @@ def bboxes_iou(boxes1, boxes2):
     inter_section = np.maximum(right_down - left_up, 0.0)
     inter_area    = inter_section[..., 0] * inter_section[..., 1]
     union_area    = boxes1_area + boxes2_area - inter_area
-    ious          = np.maximum(1.0 * inter_area / union_area, np.finfo(np.float32).eps)
+    ious          = np.maximum(1.0 * inter_area / union_area, np.finfo(DTYPE).eps)
 
     return ious
 
@@ -156,7 +177,7 @@ def nms(bboxes, iou_threshold, sigma=0.3, method='nms'):
             best_bboxes.append(best_bbox)
             cls_bboxes = np.concatenate([cls_bboxes[: max_ind], cls_bboxes[max_ind + 1:]])
             iou = bboxes_iou(best_bbox[np.newaxis, :4], cls_bboxes[:, :4])
-            weight = np.ones((len(iou),), dtype=np.float32)
+            weight = np.ones((len(iou),), dtype=DTYPE)
 
             assert method in ['nms', 'soft-nms']
 
@@ -181,7 +202,7 @@ def read_class_names(class_file_name):
             names[ID] = name.strip('\n')
     return names
 
-def draw_bbox(quantized, image, bboxes, classes=read_class_names("coco.names"), show_label=True):
+def draw_bbox(image, bboxes, classes=read_class_names("coco.names"), show_label=True):
     """
     bboxes: [x_min, y_min, x_max, y_max, probability, cls_id] format coordinates.
     returrn image, mean_prob, names
@@ -207,7 +228,8 @@ def draw_bbox(quantized, image, bboxes, classes=read_class_names("coco.names"), 
         c1, c2 = (coor[0], coor[1]), (coor[2], coor[3])
         cv2.rectangle(image, c1, c2, bbox_color, bbox_thick)
         probability.append(score)
-        cls_name = classes[class_ind] if not quantized else classes[class_ind+1]
+        # cls_name = classes[class_ind] if args.quantized is None else classes[class_ind+1]
+        cls_name = classes[class_ind]
         names.append(cls_name)
 
         if show_label:
@@ -228,21 +250,6 @@ def categoryID2name(coco_annotation, query_id):
     return query_name
 
 def main():
-    # ======= Command-line Arguments =======
-    parser = argparse.ArgumentParser(description='Run the model on given imgae dataset for object detection. acc and FPS are reported.')
-    parser.add_argument('-m', '--model', metavar='MODEL', required=True,
-                        help='path of the model')
-    parser.add_argument('-i', '--input', metavar='INPUT', required=True,
-                        help='path to the input image folder')
-    parser.add_argument('-a', '--annotation', metavar='ANNOTATION', required=True,
-                        help='path to the annotation json file')
-    parser.add_argument('-s', '--stop', metavar='STOP', type=int, default=np.inf,
-                        help='set a breaking point to stop early for testing')
-    parser.add_argument('-q', '--quantized', dest='quantized', action='store_true',
-                        help='set to decide whether we used a quantized model or not')
-    parser.add_argument('--save', metavar='SAVE',
-                        help='path to save the visual output')
-    args = parser.parse_args()
 
     # ======= Inference =======
     # Start from ORT 1.10, ORT requires explicitly setting the providers parameter if you want to use execution providers
@@ -264,21 +271,6 @@ def main():
     # print(f"Category IDs: {cat_ids}") # The IDs are not necessarily consecutive.
     # print(f"Categories Names: {cat_names}")
 
-    # # Category ID -> Category Name.
-    # query_id = cat_ids[0]
-    # query_annotation = coco_annotation.loadCats([query_id])[0]
-    # query_name = query_annotation["name"]
-    # query_supercategory = query_annotation["supercategory"]
-    # print("Category ID -> Category Name:")
-    # print(
-    #     f"Category ID: {query_id}, Category Name: {query_name}, Supercategory: {query_supercategory}"
-    # )
-    # # Category Name -> Category ID.
-    # query_name = cat_names[2]
-    # query_id = coco_annotation.getCatIds(catNms=[query_name])[0]
-    # print("Category Name -> ID:")
-    # print(f"Category Name: {query_name}, Category ID: {query_id}")
-
     # Get the ID of all the images containing the object of the category.
     img_ids = coco_annotation.getImgIds()[-args.stop:]
     print(f"Number of Images to be processed: {len(img_ids)}\n")
@@ -292,8 +284,16 @@ def main():
 
     # rt.get_device()
     # sess = rt.InferenceSession(args.model, providers=['CUDAExecutionProvider'])
-    model = onnx.load(args.model)
-    sess = backend.prepare(model, device='CUDA:0')
+    if args.gpu:
+        sess = rt.InferenceSession(args.model, providers=['CUDAExecutionProvider'])
+        print('- Device: GPU')
+    else:
+        sess = rt.InferenceSession(args.model, providers=['CPUExecutionProvider'])
+        print('- Device: CPU')
+
+    # model = onnx.load(args.model)
+    # sess = backend.prepare(model, device='CUDA:0')
+
     input_size = 416
 
     acc_list, conf_list, FPS = [], [], []
@@ -306,7 +306,7 @@ def main():
         original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
         original_image_size = original_image.shape[:2]
         image_data = image_preprocess(np.copy(original_image), [input_size, input_size])
-        image_data = image_data[np.newaxis, ...].astype(np.float32)
+        image_data = image_data[np.newaxis, ...].astype(DTYPE)
         # print(" - Preprocessed image shape:",image_data.shape) # shape of the preprocessed input
         # imsave("sample.jpg", np.asarray(original_image))
 
@@ -322,10 +322,10 @@ def main():
         # print(" - Output shape:", list(map(lambda detection: detection.shape, detections)))
 
         # ======= Start Post-processing =======
-        pred_bbox = postprocess_bbbox(args.quantized, detections, ANCHORS, STRIDES, XYSCALE)
-        bboxes = postprocess_boxes(args.quantized, pred_bbox, original_image_size, input_size, 0.25)
+        pred_bbox = postprocess_bbbox(detections, ANCHORS, STRIDES, XYSCALE)
+        bboxes = postprocess_boxes(pred_bbox, original_image_size, input_size, 0.25)
         bboxes = nms(bboxes, 0.213, method='nms')
-        image, conf, names = draw_bbox(args.quantized, original_image, bboxes)
+        image, conf, names = draw_bbox(original_image, bboxes)
 
         # ======= Scores & Output =======
         output_im = Image.fromarray(image)
